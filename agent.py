@@ -53,6 +53,26 @@ def _sep(w: int = 52) -> str:
     return "─" * w
 
 
+LLM_TIMEOUT_SEC = 90
+MAX_SAME_ACTION_RETRIES = 3
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = (os.getenv(name) or "").strip().lower()
+    return v in ("1", "true", "yes", "on") if v else default
+
+
+def _llm_timeout_sec() -> int:
+    v = os.getenv("AGENT_LLM_TIMEOUT_SEC", "").strip()
+    if v.isdigit():
+        return max(30, int(v))
+    return LLM_TIMEOUT_SEC
+
+
+DEBUG_LLM = _env_bool("AGENT_DEBUG_LLM")
+SKIP_HYDRA_NORMALIZE = _env_bool("AGENT_SKIP_HYDRA_NORMALIZE")
+
+
 def _openai_client() -> OpenAI:
     base = (os.getenv("OPENAI_BASE_URL") or "").strip().rstrip("/")
     key = (os.getenv("OPENAI_API_KEY") or "").strip()
@@ -65,6 +85,49 @@ def _openai_client() -> OpenAI:
 
 def _model() -> str:
     return (os.getenv("OPENAI_MODEL") or os.getenv("ANTHROPIC_MODEL") or "claude-sonnet-4-20250514").strip()
+
+
+def _is_hydra_claude() -> bool:
+    base = (os.getenv("OPENAI_BASE_URL") or "").lower()
+    m = _model().lower()
+    if "hydra" not in base:
+        return False
+    return any(x in m for x in ("claude", "sonnet", "haiku", "opus"))
+
+
+def _normalize_messages_for_hydra(messages: list[dict]) -> list[dict]:
+    result = []
+    for msg in messages:
+        m = dict(msg)
+        c = m.get("content")
+        if isinstance(c, list):
+            parts = []
+            for p in c:
+                if isinstance(p, dict) and p.get("type") == "text" and "text" in p:
+                    parts.append(p["text"])
+                elif isinstance(p, str):
+                    parts.append(p)
+            m["content"] = "\n".join(parts) if parts else ""
+        elif isinstance(c, dict) and c.get("type") == "text" and "text" in c:
+            m["content"] = c["text"]
+        result.append(m)
+    return result
+
+
+def _debug_log_request(step: int, normalized: bool, msgs: list[dict]) -> None:
+    payload = json.dumps(msgs, ensure_ascii=False)
+    n, size = len(msgs), len(payload)
+    roles = [x.get("role", "?") for x in msgs]
+    print(_dim("  [DEBUG LLM] шаг %d | сообщений: %d | размер: %d") % (step, n, size))
+    print(_dim("  [DEBUG LLM] роли: %s") % ", ".join(roles))
+    print(_dim("  [DEBUG LLM] Hydra+Claude нормализация: %s") % ("да" if normalized else "нет"))
+    path = _agent_dir() / "agent_debug_last_request.json"
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(msgs, f, ensure_ascii=False, indent=2)
+        print(_dim("  [DEBUG LLM] запрос: %s") % path)
+    except Exception as e:
+        print(_dim("  [DEBUG LLM] запись: %s") % e)
 
 
 def _agent_dir() -> Path:
@@ -232,7 +295,7 @@ async def run_agent() -> None:
 3a. Если открыто модальное окно (в get_page_content есть [Модальное окно] или modal): работай только с ним. Клики и ввод — только внутри. Передавай text или selector элемента, не [role=dialog]. Для ввода — placeholder или selector поля.
 4. Работай автономно, пока задача не выполнена или не понадобится уточнение у пользователя.
 5. Перед деструктивными действиями при клике по «опасному» тексту система сама спросит подтверждение у пользователя — отдельный инструмент вызывать не нужно.
-6. Перед каждым вызовом инструментов пиши 1–2 короткие фразы: что делаешь и зачем. Это показывается пользователю в логе и помогает понимать ход выполнения.
+6. Кратко сообщай о прогрессе; в конце дай итог.
 7. Сессии сохраняются автоматически при выходе. Если пользователь вручную вошёл в аккаунт в браузере (логин/пароль), вызови save_session — тогда при следующих запусках вводить логин/пароль снова не придётся.
 8. Когда задача полностью выполнена — вызови finish_task с summary (краткий итог). Не завершай задачу длинным текстом вместо вызова finish_task.
 
@@ -281,21 +344,38 @@ async def run_agent() -> None:
                 print(_green("  ▶ Начинаю выполнение"))
                 print("  " + _sep(48))
 
+                action_failures: dict[str, int] = {}
+                use_normalize = _is_hydra_claude() and not SKIP_HYDRA_NORMALIZE
+                timeout_sec = _llm_timeout_sec()
+
                 for step in range(max_steps):
                     step_used = step + 1
                     step_start = time.monotonic()
                     print()
                     print(_dim("  ── Шаг %d/%d ──") % (step + 1, max_steps))
 
-                    try:
-                        resp = client.chat.completions.create(
+                    def _llm_create():
+                        msgs = _normalize_messages_for_hydra(messages) if use_normalize else messages
+                        if DEBUG_LLM:
+                            _debug_log_request(step + 1, use_normalize, msgs)
+                        return client.chat.completions.create(
                             model=model,
-                            messages=messages,
+                            messages=msgs,
                             tools=openai_tools,
                             tool_choice="auto",
                             temperature=0.1,
                             max_tokens=4096,
                         )
+
+                    try:
+                        resp = await asyncio.wait_for(
+                            asyncio.to_thread(_llm_create),
+                            timeout=timeout_sec,
+                        )
+                    except asyncio.TimeoutError:
+                        print(_yellow("  ✗ Таймаут LLM (%d с). Прерываю шаг.") % timeout_sec)
+                        last_reply = "Таймаут LLM. Задача не завершена."
+                        break
                     except Exception as e:
                         print(_yellow("  ✗ Ошибка LLM: %s") % e)
                         last_reply = "Ошибка LLM. Задача не выполнена."
@@ -373,15 +453,25 @@ async def run_agent() -> None:
                                 done = True
                                 last_reply = summary
                             else:
-                                try:
-                                    call_result = await session.call_tool(name, arguments=args)
-                                    payload = _parse_tool_result(
-                                        getattr(call_result, "content", []) or [],
-                                        getattr(call_result, "structuredContent", None),
-                                        getattr(call_result, "isError", False),
-                                    )
-                                except Exception as e:
-                                    payload = {"success": False, "error": str(e)}
+                                action_key = "%s|%s" % (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+                                nfail = action_failures.get(action_key, 0)
+                                if nfail >= MAX_SAME_ACTION_RETRIES:
+                                    payload = {
+                                        "success": False,
+                                        "error": "Действие повторяли %d раз без успеха. Попробуй другой способ или finish_task." % MAX_SAME_ACTION_RETRIES,
+                                    }
+                                else:
+                                    try:
+                                        call_result = await session.call_tool(name, arguments=args)
+                                        payload = _parse_tool_result(
+                                            getattr(call_result, "content", []) or [],
+                                            getattr(call_result, "structuredContent", None),
+                                            getattr(call_result, "isError", False),
+                                        )
+                                    except Exception as e:
+                                        payload = {"success": False, "error": str(e)}
+                                    if not payload.get("success", True):
+                                        action_failures[action_key] = nfail + 1
                             payload_str = json.dumps(payload, ensure_ascii=False)
                             short = _format_tool_result(name, payload)
                             print(_dim("       → %s") % short)

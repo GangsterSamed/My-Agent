@@ -1,5 +1,6 @@
 .env
 browser_state.json
+agent_debug_last_request.json
 *.pyc
 __pycache__/
 .venv/
