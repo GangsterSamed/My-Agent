@@ -209,12 +209,12 @@ class BrowserMCPServer:
         self._page = pages[0]
 
     def _strip_dialog_selector(self, sel: str) -> str | None:
-        """Убрать ведущий [role=dialog] / [aria-modal] из селектора. Если после этого пусто — None (использовать text)."""
+        """Убрать ведущий [role=dialog/alertdialog] / [aria-modal] из селектора. Если после этого пусто — None (использовать text)."""
         if not sel or not isinstance(sel, str):
             return None
         s = sel.strip()
         m = re.match(
-            r"^\s*(?:\[role\s*=\s*[\"']dialog[\"']\]|\[aria-modal\s*=\s*[\"']true[\"']\])\s*(.*)$",
+            r"^\s*(?:\[role\s*=\s*[\"'](?:dialog|alertdialog)[\"']\]|\[aria-modal\s*=\s*[\"']true[\"']\])\s*(.*)$",
             s,
             re.IGNORECASE,
         )
@@ -224,10 +224,9 @@ class BrowserMCPServer:
         return rest if rest else None
 
     async def _get_dialog_locator(self):
-        """Первый видимый диалог ([role=dialog], [aria-modal], .modal и т.п.). None если нет."""
+        """Первый видимый ARIA-диалог: role=dialog | role=alertdialog | aria-modal=true. Без классовых селекторов."""
         batches = [
-            "[role=\"dialog\"], [aria-modal=\"true\"]",
-            ".modal, [class*=\"modal\"], [class*=\"Modal\"], [class*=\"popup\"], [class*=\"Popup\"]",
+            "[role=\"dialog\"], [role=\"alertdialog\"], [aria-modal=\"true\"]",
         ]
         for sel in batches:
             loc = self._page.locator(sel)
@@ -249,7 +248,6 @@ class BrowserMCPServer:
         await self._ensure_single_tab()
         try:
             await self._page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-            await self._page.wait_for_load_state("networkidle", timeout=15_000)
         except Exception as e:
             return {"success": False, "error": str(e), "url": url}
         return {
@@ -263,10 +261,6 @@ class BrowserMCPServer:
         await self._ensure_single_tab()
         include_html = bool(args.get("include_html"))
         try:
-            await self._page.wait_for_load_state("networkidle", timeout=10_000)
-        except Exception:
-            pass
-        try:
             content = await self._page.evaluate(
                 """
                 () => {
@@ -276,7 +270,12 @@ class BrowserMCPServer:
                     const sel = (s, r) => (r || root).querySelectorAll(s);
                     const arr = (q) => Array.from(q);
                     let modal = null;
-                    const dialog = root.querySelector('[role="dialog"]') || root.querySelector('[aria-modal="true"]') || root.querySelector('.modal') || root.querySelector('[data-qa*="modal"]') || root.querySelector('[class*="modal"][class*="open"]') || root.querySelector('[class*="modal"]') || root.querySelector('[class*="popup"]') || root.querySelector('[class*="Popup"]');
+                    const dialogEl = root.querySelector('[role="dialog"]') || root.querySelector('[role="alertdialog"]') || root.querySelector('[aria-modal="true"]');
+                    let dialog = null;
+                    if (dialogEl) {
+                        const r = dialogEl.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) { dialog = dialogEl; }
+                    }
                     if (dialog) {
                         const mt = (dialog.innerText || '').trim().slice(0, 4000);
                         const mb = arr(sel('button, [role="button"], input[type="submit"]', dialog))
@@ -299,7 +298,23 @@ class BrowserMCPServer:
                     const maxText = 18000;
                     let text = bodyText.slice(0, maxText);
                     if (modal && modal.text) {
-                        const prefix = '\\n[Модальное окно]\\n' + modal.text.slice(0, 2500) + '\\n\\n';
+                        let prefix = '\\n[Модальное окно]\\n';
+                        if (modal.buttons && modal.buttons.length) {
+                            const btns = modal.buttons.map(function(t) {
+                                return (t || '').trim().replace(/\\s+/g, ' ').slice(0, 120);
+                            }).filter(Boolean);
+                            if (btns.length)
+                                prefix += 'Кнопки в модалке: ' + btns.map(function(t) { return '«' + t + '»'; }).join(', ') + '\\n\\n';
+                        }
+                        if (modal.inputs && modal.inputs.length) {
+                            const parts = modal.inputs.map(function(inp) {
+                                var ph = (inp.placeholder || '').trim().slice(0, 80);
+                                return ph ? ('placeholder «' + ph + '»') : (inp.name || inp.id || inp.type || '');
+                            }).filter(Boolean);
+                            if (parts.length)
+                                prefix += 'Поля в модалке: ' + parts.join(', ') + '\\n\\n';
+                        }
+                        prefix += modal.text.slice(0, 2500) + '\\n\\n';
                         text = prefix + text.slice(0, maxText - prefix.length);
                     }
                     return {
@@ -437,7 +452,6 @@ class BrowserMCPServer:
         await self._ensure_single_tab()
         try:
             await self._page.go_back(wait_until="domcontentloaded", timeout=15_000)
-            await self._page.wait_for_load_state("networkidle", timeout=10_000)
         except Exception as e:
             return {"success": False, "error": str(e)}
         return {

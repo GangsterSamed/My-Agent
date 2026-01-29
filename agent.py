@@ -21,11 +21,10 @@ from openai import OpenAI
 
 load_dotenv()
 
-# Паттерны «опасных» действий — перед выполнением спрашиваем пользователя (security layer)
+# Паттерны «опасных» действий — перед выполнением спрашиваем пользователя (security layer).
 DANGEROUS_PATTERNS = re.compile(
-    r"\b(оплатить|подтвердить\s*заказ|удалить\s*навсегда|оформить\s*заказ|"
-    r"pay|checkout|confirm\s*order|delete\s*permanently|"
-    r"подтвердить\s*оплату|купить|buy)\b",
+    r"\b(удалить\s*навсегда|удалить|delete\s*permanently|delete|"
+    r"оплатить|подтвердить\s*оплату|pay)\b",
     re.IGNORECASE,
 )
 
@@ -151,8 +150,10 @@ async def _read_line(prompt: str) -> str:
 
 
 async def _confirm(prompt: str) -> bool:
-    line = await _read_line(prompt)
-    return line.lower() in ("y", "yes", "д", "да")
+    line = (await _read_line(prompt)).strip().lower()
+    if line in ("n", "no", "н", "нет"):
+        return False
+    return line in ("y", "yes", "д", "да")
 
 
 def _parse_tool_result(content: list, structured: dict | None, is_error: bool) -> dict:
@@ -427,7 +428,7 @@ async def run_agent() -> None:
                                 text = args.get("text") or ""
                                 if DANGEROUS_PATTERNS.search(text):
                                     ok = await _confirm(
-                                        _yellow('  Подтвердить действие "%s"? (y/n) ') % text
+                                        _yellow('  Подтвердить действие "%s"? (да/нет) ') % text
                                     )
                                     if not ok:
                                         result = {"success": False, "error": "Пользователь отклонил действие"}
@@ -497,6 +498,11 @@ async def run_agent() -> None:
                         for line in content_str.splitlines():
                             print("  " + line)
                         print()
+                        if "?" in content_str:
+                            reply = (await _read_line(_yellow("  Ваш ответ (да/нет или Enter чтобы продолжить) > "))).strip()
+                            if reply:
+                                messages.append({"role": "user", "content": "Ответ пользователя: " + reply})
+                                print()
 
                     step_elapsed = time.monotonic() - step_start
                     print(_dim("  ⏱ %.1f с") % step_elapsed)
