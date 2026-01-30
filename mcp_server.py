@@ -31,6 +31,14 @@ QUIET = os.getenv("AGENT_QUIET", "true").lower() in ("1", "true", "yes")
 ACTION_TIMEOUT_MS = 8_000
 
 
+def _normalize_text(s: str | None) -> str:
+    """Нормализация текста для Playwright: неразрывные пробелы и лишние пробелы."""
+    if s is None or not isinstance(s, str):
+        return ""
+    t = s.replace("\xa0", " ").replace("\u202f", " ")
+    return " ".join(t.split())
+
+
 def _tools() -> list[types.Tool]:
     return [
         types.Tool(
@@ -44,7 +52,7 @@ def _tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_page_content",
-            description="Получить содержимое текущей страницы: текст, кнопки, ссылки, поля ввода. Используй для анализа перед действиями.",
+            description="Получить содержимое текущей страницы: текст, кнопки, ссылки, поля ввода. В начале текста — список полей для ввода (field_index 1, 2, 3…) для type_text. Используй для анализа перед действиями.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -71,25 +79,34 @@ def _tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="type_text",
-            description="Ввести текст в поле. Используй placeholder или selector, если полей несколько. Длинный текст вводится в textarea. Checkbox/radio не поддерживаются.",
+            description="Ввести текст в поле. Если полей несколько — укажи field_index (1, 2, 3…) по порядку полей в get_page_content, либо placeholder/selector. Длинный текст вводится в textarea. Checkbox/radio не поддерживаются.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "text": {"type": "string", "description": "Текст для ввода"},
                     "selector": {"type": "string", "description": "CSS-селектор поля"},
                     "placeholder": {"type": "string", "description": "Placeholder поля для поиска"},
+                    "field_index": {
+                        "type": "integer",
+                        "description": "Номер поля по порядку (1-based). Порядок — как в DOM: все видимые input (кроме checkbox/radio), textarea, contenteditable. Используй, когда полей несколько и нужно заполнить конкретное по счёту.",
+                        "minimum": 1,
+                    },
                 },
                 "required": ["text"],
             },
         ),
         types.Tool(
             name="scroll",
-            description="Проскроллить страницу вверх или вниз.",
+            description="Проскроллить страницу или внутренний контейнер. Без container_selector — скролл окна. С container_selector — скролл указанного элемента (меню, сайдбар и т.д.). Возвращает обновлённое содержимое страницы.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "direction": {"type": "string", "enum": ["up", "down"], "default": "down"},
                     "amount": {"type": "integer", "description": "Пиксели", "default": 500},
+                    "container_selector": {
+                        "type": "string",
+                        "description": "CSS-селектор скроллируемого контейнера (опционально). Если кнопки/ссылки внутри меню не видны — укажи контейнер из get_page_content.",
+                    },
                 },
             },
         ),
@@ -256,79 +273,142 @@ class BrowserMCPServer:
             "title": await self._page.title(),
         }
 
+    _PAGE_CONTENT_SCRIPT = """
+        () => {
+            document.querySelectorAll('a[target="_blank"], a[target="_new"]').forEach(a => a.removeAttribute('target'));
+            const root = document.body;
+            const bodyText = root?.innerText ?? '';
+            const sel = (s, r) => (r || root).querySelectorAll(s);
+            const arr = (q) => Array.from(q);
+            let modal = null;
+            const dialogEl = root.querySelector('[role="dialog"]') || root.querySelector('[role="alertdialog"]') || root.querySelector('[aria-modal="true"]');
+            let dialog = null;
+            if (dialogEl) {
+                const r = dialogEl.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) { dialog = dialogEl; }
+            }
+            if (dialog) {
+                const mt = (dialog.innerText || '').trim().slice(0, 4000);
+                const mb = arr(sel('button, [role="button"], input[type="submit"]', dialog))
+                    .map(el => el.innerText?.trim() || el.value || el.getAttribute('aria-label') || '')
+                    .filter(t => t).slice(0, 20);
+                const mi = arr(sel('input:not([type=hidden]):not([type=checkbox]):not([type=radio]), textarea, select', dialog))
+                    .map(el => ({ type: el.type || el.tagName.toLowerCase(), placeholder: el.placeholder || '', name: el.name || '', id: el.id || '' }))
+                    .slice(0, 20);
+                modal = { text: mt, buttons: mb, inputs: mi };
+            }
+            const buttons = arr(sel('button, [role="button"], input[type="submit"]'))
+                .map(el => el.innerText?.trim() || el.value || el.getAttribute('aria-label') || '')
+                .filter(t => t).slice(0, 30);
+            const links = arr(sel('a[href]'))
+                .map(el => ({ text: (el.innerText || '').trim().slice(0, 200), href: el.href }))
+                .filter(l => l.text).slice(0, 50);
+            const inputs = arr(sel('input, textarea, select'))
+                .map(el => ({ type: el.type, placeholder: el.placeholder || '', name: el.name || '', id: el.id || '' }))
+                .slice(0, 30);
+            const isVisible = (el) => {
+                if (!el || !el.getBoundingClientRect) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 && r.height === 0) return false;
+                const s = window.getComputedStyle ? window.getComputedStyle(el) : {};
+                if (s.display === 'none' || s.visibility === 'hidden') return false;
+                return true;
+            };
+            const fillableSelector = 'input:not([type=checkbox]):not([type=radio]):not([type=hidden]), textarea, [contenteditable="true"]';
+            const fillableInputs = arr(sel(fillableSelector))
+                .filter(isVisible)
+                .slice(0, 50)
+                .map((el, i) => {
+                    const ph = (el.placeholder || '').trim();
+                    const name = (el.name || '').trim();
+                    const id = (el.id || '').trim();
+                    const type = (el.type || el.tagName.toLowerCase() || '').toLowerCase();
+                    let label = '';
+                    if (el.id && root) {
+                        const arrLabels = arr(root.querySelectorAll('label'));
+                        const labelEl = arrLabels.find(function(lab) { return lab.htmlFor === el.id; });
+                        if (labelEl) label = (labelEl.innerText || '').trim().slice(0, 80);
+                    }
+                    if (!label && el.closest('label')) {
+                        const par = el.closest('label');
+                        if (par) label = (par.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 80);
+                    }
+                    return { index: i + 1, placeholder: ph, name, id, type, label: label.slice(0, 80) };
+                });
+            const maxText = 18000;
+            let text = bodyText.slice(0, maxText);
+            if (modal && modal.text) {
+                let prefix = '\\n[Модальное окно]\\n';
+                if (modal.buttons && modal.buttons.length) {
+                    const btns = modal.buttons.map(function(t) {
+                        return (t || '').trim().replace(/\\s+/g, ' ').slice(0, 120);
+                    }).filter(Boolean);
+                    if (btns.length)
+                        prefix += 'Кнопки в модалке: ' + btns.map(function(t) { return '«' + t + '»'; }).join(', ') + '\\n\\n';
+                }
+                if (modal.inputs && modal.inputs.length) {
+                    const parts = modal.inputs.map(function(inp) {
+                        var ph = (inp.placeholder || '').trim().slice(0, 80);
+                        return ph ? ('placeholder «' + ph + '»') : (inp.name || inp.id || inp.type || '');
+                    }).filter(Boolean);
+                    if (parts.length)
+                        prefix += 'Поля в модалке: ' + parts.join(', ') + '\\n\\n';
+                }
+                prefix += modal.text.slice(0, 2500) + '\\n\\n';
+                text = prefix + text.slice(0, maxText - prefix.length);
+            }
+            const scrollable = [];
+            const check = (el) => {
+                if (!el || el === document.body) return;
+                const s = getComputedStyle(el);
+                const oy = (s.overflowY || s.overflow || '').toLowerCase();
+                if (!/auto|scroll|overlay/.test(oy) || el.scrollHeight <= el.clientHeight) return;
+                let sel = el.id ? '#' + el.id : null;
+                if (!sel && el.className && typeof el.className === 'string') {
+                    const c = (el.className.trim().split(/\\s+/)[0] || '').replace(/[^a-zA-Z0-9_-]/g, '');
+                    if (c) sel = el.tagName.toLowerCase() + '.' + c;
+                }
+                if (!sel) sel = el.getAttribute('role') ? '[role="' + el.getAttribute('role') + '"]' : el.tagName.toLowerCase();
+                if (sel) scrollable.push(sel);
+            };
+            arr(sel('main, [role="main"], [role="feed"], aside, [class*="menu"], [class*="list"], [class*="scroll"]')).slice(0, 8).forEach(check);
+            if (scrollable.length) {
+                text = 'Скроллируемые контейнеры (для scroll с container_selector): ' + [...new Set(scrollable)].slice(0, 5).join(', ') + '\\n\\n' + text;
+            }
+            if (fillableInputs.length > 0) {
+                const parts = fillableInputs.map(function(inp) {
+                    const ph = inp.placeholder ? ('placeholder «' + inp.placeholder + '»') : '';
+                    const nm = inp.name ? ('name «' + inp.name + '»') : '';
+                    const lb = inp.label ? ('label «' + inp.label + '»') : '';
+                    const desc = [ph, nm, lb].filter(Boolean).join(', ') || ('type ' + inp.type);
+                    return inp.index + ' — ' + desc;
+                });
+                text = 'Поля для ввода (field_index для type_text): ' + parts.join('; ') + '\\n\\n' + text;
+            }
+            return {
+                text,
+                modal,
+                buttons,
+                links,
+                inputs,
+                fillable_inputs: fillableInputs,
+                scrollable_containers: [...new Set(scrollable)].slice(0, 5),
+                url: window.location.href,
+                title: document.title
+            };
+        }
+    """
+
+    async def _fetch_page_content(self) -> dict[str, Any]:
+        """Выполнить evaluate и вернуть {text, modal, buttons, links, inputs, url, title}."""
+        return await self._page.evaluate(self._PAGE_CONTENT_SCRIPT)
+
     async def _get_page_content(self, args: dict[str, Any]) -> dict[str, Any]:
         await self._ensure_browser()
         await self._ensure_single_tab()
         include_html = bool(args.get("include_html"))
         try:
-            content = await self._page.evaluate(
-                """
-                () => {
-                    document.querySelectorAll('a[target="_blank"], a[target="_new"]').forEach(a => a.removeAttribute('target'));
-                    const root = document.body;
-                    const bodyText = root?.innerText ?? '';
-                    const sel = (s, r) => (r || root).querySelectorAll(s);
-                    const arr = (q) => Array.from(q);
-                    let modal = null;
-                    const dialogEl = root.querySelector('[role="dialog"]') || root.querySelector('[role="alertdialog"]') || root.querySelector('[aria-modal="true"]');
-                    let dialog = null;
-                    if (dialogEl) {
-                        const r = dialogEl.getBoundingClientRect();
-                        if (r.width > 0 && r.height > 0) { dialog = dialogEl; }
-                    }
-                    if (dialog) {
-                        const mt = (dialog.innerText || '').trim().slice(0, 4000);
-                        const mb = arr(sel('button, [role="button"], input[type="submit"]', dialog))
-                            .map(el => el.innerText?.trim() || el.value || el.getAttribute('aria-label') || '')
-                            .filter(t => t).slice(0, 20);
-                        const mi = arr(sel('input:not([type=hidden]):not([type=checkbox]):not([type=radio]), textarea, select', dialog))
-                            .map(el => ({ type: el.type || el.tagName.toLowerCase(), placeholder: el.placeholder || '', name: el.name || '', id: el.id || '' }))
-                            .slice(0, 20);
-                        modal = { text: mt, buttons: mb, inputs: mi };
-                    }
-                    const buttons = arr(sel('button, [role="button"], input[type="submit"]'))
-                        .map(el => el.innerText?.trim() || el.value || el.getAttribute('aria-label') || '')
-                        .filter(t => t).slice(0, 30);
-                    const links = arr(sel('a[href]'))
-                        .map(el => ({ text: (el.innerText || '').trim().slice(0, 200), href: el.href }))
-                        .filter(l => l.text).slice(0, 50);
-                    const inputs = arr(sel('input, textarea, select'))
-                        .map(el => ({ type: el.type, placeholder: el.placeholder || '', name: el.name || '', id: el.id || '' }))
-                        .slice(0, 30);
-                    const maxText = 18000;
-                    let text = bodyText.slice(0, maxText);
-                    if (modal && modal.text) {
-                        let prefix = '\\n[Модальное окно]\\n';
-                        if (modal.buttons && modal.buttons.length) {
-                            const btns = modal.buttons.map(function(t) {
-                                return (t || '').trim().replace(/\\s+/g, ' ').slice(0, 120);
-                            }).filter(Boolean);
-                            if (btns.length)
-                                prefix += 'Кнопки в модалке: ' + btns.map(function(t) { return '«' + t + '»'; }).join(', ') + '\\n\\n';
-                        }
-                        if (modal.inputs && modal.inputs.length) {
-                            const parts = modal.inputs.map(function(inp) {
-                                var ph = (inp.placeholder || '').trim().slice(0, 80);
-                                return ph ? ('placeholder «' + ph + '»') : (inp.name || inp.id || inp.type || '');
-                            }).filter(Boolean);
-                            if (parts.length)
-                                prefix += 'Поля в модалке: ' + parts.join(', ') + '\\n\\n';
-                        }
-                        prefix += modal.text.slice(0, 2500) + '\\n\\n';
-                        text = prefix + text.slice(0, maxText - prefix.length);
-                    }
-                    return {
-                        text,
-                        modal,
-                        buttons,
-                        links,
-                        inputs,
-                        url: window.location.href,
-                        title: document.title
-                    };
-                }
-                """
-            )
+            content = await self._fetch_page_content()
             out: dict[str, Any] = {"success": True, "content": content}
             if include_html:
                 out["html"] = (await self._page.content())[:50000]
@@ -352,7 +432,7 @@ class BrowserMCPServer:
             except Exception:
                 pass
         use_sel = sel
-        use_text = text
+        use_text = _normalize_text(text) if text else None
         if scope != self._page and sel:
             stripped = self._strip_dialog_selector(sel)
             if stripped is None:
@@ -369,27 +449,72 @@ class BrowserMCPServer:
         try:
             if use_sel:
                 loc = scope.locator(use_sel).first
-                await loc.click(timeout=ACTION_TIMEOUT_MS)
             elif use_text:
                 loc = scope.get_by_text(use_text, exact=exact).first
-                try:
-                    await loc.click(timeout=ACTION_TIMEOUT_MS)
-                except Exception:
-                    if scope != self._page:
-                        loc = scope.get_by_role("button", name=use_text).first
-                        await loc.click(timeout=ACTION_TIMEOUT_MS)
-                    else:
-                        raise
             elif role:
                 loc = scope.locator(f"[role='{role}']").first
-                await loc.click(timeout=ACTION_TIMEOUT_MS)
             else:
                 return {"success": False, "error": "Укажи text, selector или role"}
+
+            try:
+                await loc.scroll_into_view_if_needed(timeout=5_000)
+            except Exception:
+                pass
+
+            if use_sel:
+                await loc.click(timeout=ACTION_TIMEOUT_MS)
+            elif use_text:
+                err = None
+                try:
+                    await loc.click(timeout=ACTION_TIMEOUT_MS)
+                except Exception as e:
+                    err = e
+                if err is not None:
+                    for fallback_role in ("button", "link"):
+                        try:
+                            loc2 = scope.get_by_role(fallback_role, name=use_text).first
+                            try:
+                                await loc2.scroll_into_view_if_needed(timeout=5_000)
+                            except Exception:
+                                pass
+                            await loc2.click(timeout=ACTION_TIMEOUT_MS)
+                            err = None
+                            break
+                        except Exception as e2:
+                            err = e2
+                    if err is not None and use_text and exact:
+                        try:
+                            loc_partial = scope.get_by_text(use_text, exact=False).first
+                            try:
+                                await loc_partial.scroll_into_view_if_needed(timeout=5_000)
+                            except Exception:
+                                pass
+                            await loc_partial.click(timeout=ACTION_TIMEOUT_MS)
+                            err = None
+                        except Exception as e2b:
+                            err = e2b
+                    if err is not None and use_text:
+                        short_text = (use_text[:50].strip() if len(use_text) > 50 else use_text).strip()
+                        if short_text and len(short_text) < len(use_text):
+                            try:
+                                loc_short = scope.get_by_text(short_text, exact=False).first
+                                try:
+                                    await loc_short.scroll_into_view_if_needed(timeout=5_000)
+                                except Exception:
+                                    pass
+                                await loc_short.click(timeout=ACTION_TIMEOUT_MS)
+                                err = None
+                            except Exception as e3:
+                                err = e3
+                    if err is not None:
+                        raise err
+            elif role:
+                await loc.click(timeout=ACTION_TIMEOUT_MS)
             await asyncio.sleep(0.8)
             return {"success": True}
         except Exception as e:
             err = str(e)
-            sug = "Попробуй другой способ (другой текст/селектор) или scroll перед кликом."
+            sug = "Попробуй другой способ (другой текст/селектор) или scroll перед кликом. Используй только текст кнопок/ссылок из последнего get_page_content; для длинных названий — короткий фрагмент (первые слова)."
             if scope != self._page and ("timeout" in err.lower() or "exceeded" in err.lower()):
                 sug = "Диалог открыт: ищи элементы только внутри него. Элементы страницы под ним недоступны."
             return {"success": False, "error": err, "suggestion": sug}
@@ -399,7 +524,8 @@ class BrowserMCPServer:
         await self._ensure_single_tab()
         text = args.get("text") or ""
         sel = args.get("selector")
-        placeholder = args.get("placeholder")
+        placeholder = _normalize_text(args.get("placeholder")) or None
+        field_index_raw = args.get("field_index")
         scope = await self._get_dialog_locator()
         if scope is None:
             scope = self._page
@@ -408,12 +534,33 @@ class BrowserMCPServer:
                 await scope.scroll_into_view_if_needed(timeout=2_000)
             except Exception:
                 pass
-        input_ok = "input:not([type=checkbox]):not([type=radio]):visible"
+        field_index: int | None = None
+        if field_index_raw is not None:
+            try:
+                idx = int(field_index_raw)
+                if idx < 1:
+                    return {
+                        "success": False,
+                        "error": "field_index должен быть >= 1.",
+                        "suggestion": "Нумерация полей с 1 по порядку из get_page_content (inputs).",
+                    }
+                field_index = idx
+            except (TypeError, ValueError):
+                return {
+                    "success": False,
+                    "error": "field_index должен быть целым числом >= 1.",
+                    "suggestion": "Укажи номер поля по порядку (1, 2, 3…).",
+                }
+        input_ok = "input:not([type=checkbox]):not([type=radio]):not([type=hidden]):visible"
+        combined_selector = f"{input_ok}, textarea:visible, [contenteditable='true']"
         try:
             if sel:
                 await scope.locator(sel).first.fill(text, timeout=ACTION_TIMEOUT_MS)
             elif placeholder:
                 await scope.get_by_placeholder(placeholder).first.fill(text, timeout=ACTION_TIMEOUT_MS)
+            elif field_index is not None:
+                loc = scope.locator(combined_selector).nth(field_index - 1)
+                await loc.fill(text, timeout=ACTION_TIMEOUT_MS)
             elif len(text) > 80:
                 txt = scope.locator("textarea:visible")
                 if await txt.count() > 0:
@@ -424,17 +571,23 @@ class BrowserMCPServer:
                     ).first
                     await loc.fill(text, timeout=ACTION_TIMEOUT_MS)
             else:
-                loc = scope.locator(
-                    f"{input_ok}, textarea:visible, [contenteditable='true']"
-                ).first
+                loc = scope.locator(combined_selector).first
                 await loc.fill(text, timeout=ACTION_TIMEOUT_MS)
             await asyncio.sleep(0.3)
             return {"success": True}
         except Exception as e:
             err = str(e)
-            suf = ""
+            err_lower = err.lower()
+            suf = " Вызови get_page_content и укажи placeholder, selector или field_index (1, 2, 3…) по порядку полей; для сопроводительного письма ищи textarea."
+            if ("timeout" in err_lower or "exceeded" in err_lower) and (
+                "input" in err_lower or "textarea" in err_lower or "placeholder" in err_lower or "locator(" in err_lower
+            ):
+                suf += " Если форма с полями ещё не открыта — сначала открой её (кнопка/ссылка на странице), затем get_page_content и заполняй поля по placeholder/selector/field_index. [hint: open_form_first]"
             if scope != self._page:
-                suf = " Диалог открыт: используй placeholder или selector для поля внутри него."
+                suf += " Диалог открыт: используй placeholder или selector для поля внутри него."
+            if field_index is not None:
+                suf += " Если field_index — проверь, что номер не больше числа полей (в списке inputs не считай checkbox/radio)."
+            suf += " Нумерация field_index — из строки «Поля для ввода» в начале get_page_content."
             return {"success": False, "error": err + suf}
 
     async def _scroll(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -443,9 +596,41 @@ class BrowserMCPServer:
         direction = (args.get("direction") or "down").lower()
         amount = max(0, int(args.get("amount") or 500))
         delta = amount if direction == "down" else -amount
-        await self._page.evaluate("d => window.scrollBy(0, d)", delta)
+        container_sel = (args.get("container_selector") or "").strip()
+
+        if container_sel:
+            try:
+                result = await self._page.evaluate(
+                    """
+                    ([selector, delta]) => {
+                        const el = document.querySelector(selector);
+                        if (!el) return { error: "Контейнер не найден: " + selector };
+                        const before = el.scrollTop || 0;
+                        el.scrollTop = Math.max(0, before + delta);
+                        return {
+                            scrollTop: el.scrollTop,
+                            scrollHeight: el.scrollHeight,
+                            clientHeight: el.clientHeight
+                        };
+                    }
+                    """,
+                    [container_sel, delta],
+                )
+                if isinstance(result, dict) and result.get("error"):
+                    return {"success": False, "error": result["error"]}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+        else:
+            await self._page.evaluate("d => window.scrollBy(0, d)", delta)
+
         await asyncio.sleep(0.4)
-        return {"success": True}
+        out: dict[str, Any] = {"success": True}
+        try:
+            content = await self._fetch_page_content()
+            out["content"] = content
+        except Exception:
+            pass
+        return out
 
     async def _go_back(self, args: dict[str, Any]) -> dict[str, Any]:
         await self._ensure_browser()
