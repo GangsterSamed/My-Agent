@@ -10,8 +10,11 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
+
+DIAG = os.getenv("AGENT_DIAG", "").strip().lower() in ("1", "true", "yes")
 
 import mcp.types as types
 from mcp.types import ServerCapabilities, ToolsCapability
@@ -153,6 +156,9 @@ class BrowserMCPServer:
         self._browser = None
         self._context = None
         self._page = None
+        self._last_nav_time: float | None = None
+        self._last_click_time: float | None = None
+        self._last_get_content_time: float | None = None
         self._setup_handlers()
 
     def _setup_handlers(self) -> None:
@@ -276,12 +282,45 @@ class BrowserMCPServer:
             await self._page.goto(url, wait_until="domcontentloaded", timeout=60_000)
         except Exception as e:
             return {"success": False, "error": str(e), "url": url}
+        self._last_nav_time = time.monotonic()
+        if DIAG:
+            print("[DIAG] navigate done url=%s" % (url[:80] + "…" if len(url) > 80 else url), file=sys.stderr)
         return {
             "success": True,
             "url": self._page.url,
             "title": await self._page.title(),
             "page_navigated": True,
         }
+
+    async def _diag_page(self) -> dict[str, Any]:
+        try:
+            return await self._page.evaluate(
+                """
+                () => {
+                    const body = (document.body && document.body.innerText) || '';
+                    const scrollY = window.scrollY || 0;
+                    const scrollHeight = document.documentElement.scrollHeight || 0;
+                    const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'));
+                    const btexts = buttons.map(el => (el.innerText || el.value || el.getAttribute('aria-label') || '').trim()).filter(Boolean);
+                    const withKorzina = btexts.filter(t => /корзин|в корзину/i.test(t));
+                    const withBurger = btexts.filter(t => /бургер|burger/i.test(t));
+                    return {
+                        scrollY,
+                        scrollHeight,
+                        bodyLen: body.length,
+                        bodyHasVKorzinu: body.includes('В корзину'),
+                        bodyHasBurger: /бургер|burger/i.test(body),
+                        numButtons: buttons.length,
+                        numInputs: document.querySelectorAll('input, textarea, select').length,
+                        buttonsWithKorzina: withKorzina,
+                        buttonsWithBurger: withBurger.slice(0, 5),
+                        firstButtons: btexts.slice(0, 8)
+                    };
+                }
+                """
+            )
+        except Exception as e:
+            return {"error": str(e)}
 
     _PAGE_CONTENT_SCRIPT = """
         () => {
@@ -455,8 +494,46 @@ class BrowserMCPServer:
         await self._ensure_browser()
         await self._ensure_single_tab()
         include_html = bool(args.get("include_html"))
+        if DIAG:
+            d = await self._diag_page()
+            tn = self._last_nav_time
+            tc = self._last_click_time
+            tg = self._last_get_content_time
+            now = time.monotonic()
+            parts = [
+                "get_page_content",
+                "time_since_nav=%.1fs" % (now - tn) if tn is not None else "time_since_nav=N/A",
+                "time_since_click=%.1fs" % (now - tc) if tc is not None else "time_since_click=N/A",
+                "time_since_last_get=%.1fs" % (now - tg) if tg is not None else "time_since_last_get=N/A",
+            ]
+            if "error" in d:
+                parts.append("diag_error=" + str(d["error"]))
+            else:
+                parts.extend([
+                    "scrollY=%d" % d.get("scrollY", 0),
+                    "scrollH=%d" % d.get("scrollHeight", 0),
+                    "bodyLen=%d" % d.get("bodyLen", 0),
+                    "bodyHasVKorzinu=%s" % d.get("bodyHasVKorzinu"),
+                    "bodyHasBurger=%s" % d.get("bodyHasBurger"),
+                    "numButtons=%d" % d.get("numButtons", 0),
+                    "numInputs=%d" % d.get("numInputs", 0),
+                    "btnsKorzina=%s" % (str(d.get("buttonsWithKorzina") or [])[:80]),
+                    "btnsBurger=%s" % (str(d.get("buttonsWithBurger") or [])[:80]),
+                    "firstBtns=%s" % (str(d.get("firstButtons") or [])[:120]),
+                ])
+            print("[DIAG] " + " ".join(str(p) for p in parts), file=sys.stderr)
+        self._last_get_content_time = time.monotonic()
         try:
             content = await self._fetch_page_content()
+            if DIAG:
+                fb = content.get("filtered_buttons") or 0
+                fl = content.get("filtered_links") or 0
+                if fb > 0 or fl > 0:
+                    print(
+                        "[DIAG] filter_off_screen filtered_buttons=%d filtered_links=%d (off-screen/sr-only excluded from content)"
+                        % (fb, fl),
+                        file=sys.stderr,
+                    )
             out: dict[str, Any] = {"success": True, "content": {k: v for k, v in content.items() if k not in ("filtered_buttons", "filtered_links")}}
             if include_html:
                 out["html"] = (await self._page.content())[:50000]
@@ -471,6 +548,17 @@ class BrowserMCPServer:
         text = args.get("text")
         role = args.get("role")
         exact = bool(args.get("exact", False))
+        if DIAG:
+            tg = self._last_get_content_time
+            now = time.monotonic()
+            tsg = (now - tg) if tg is not None else None
+            pre = "click_element start"
+            if text:
+                pre += " text=%r" % (text[:60] + "…" if len(text) > 60 else text)
+            if sel:
+                pre += " selector=%r" % (sel[:60] + "…" if len(sel) > 60 else sel)
+            pre += " time_since_get_content=%s" % ("%.1fs" % tsg if tsg is not None else "N/A")
+            print("[DIAG] " + pre, file=sys.stderr)
         scope = await self._get_dialog_locator()
         if scope is None:
             scope = self._page
@@ -481,6 +569,8 @@ class BrowserMCPServer:
                 pass
         use_sel = sel
         use_text = _normalize_text(text) if text else None
+        if DIAG and text and any(c in text for c in "\xa0\u202f\u2009\u2028\u2029\n\r"):
+            print("[DIAG] click_element text normalized (had unicode spaces/newlines)", file=sys.stderr)
         if scope != self._page and sel:
             stripped = self._strip_dialog_selector(sel)
             if stripped is None:
@@ -516,9 +606,12 @@ class BrowserMCPServer:
                         await loc.click(timeout=ACTION_TIMEOUT_MS, no_wait_after=True)
                     else:
                         raise
+            self._last_click_time = time.monotonic()
             await asyncio.sleep(0.8)
             url_after = self._page.url
             page_navigated = url_after != url_before_click
+            if DIAG:
+                print("[DIAG] click_element done (slept 0.8s)%s" % (" page_navigated=1" if page_navigated else ""), file=sys.stderr)
             result: dict[str, Any] = {"success": True}
             if page_navigated:
                 result["page_navigated"] = True
@@ -572,6 +665,8 @@ class BrowserMCPServer:
             elif field_index is not None:
                 loc = scope.locator(combined_selector).nth(field_index - 1)
                 await loc.fill(text, timeout=ACTION_TIMEOUT_MS)
+                if DIAG:
+                    print("[DIAG] type_text filled field_index=%d" % field_index, file=sys.stderr)
             elif len(text) > 80:
                 txt = scope.locator("textarea:visible")
                 if await txt.count() > 0:
@@ -629,16 +724,45 @@ class BrowserMCPServer:
                 )
                 if isinstance(result, dict) and result.get("error"):
                     return {"success": False, "error": result["error"]}
+                if DIAG:
+                    print(
+                        "[DIAG] scroll container=%r direction=%s amount=%d scrollTop=%s scrollH=%s clientH=%s"
+                        % (
+                            container_sel[:60],
+                            direction,
+                            amount,
+                            result.get("scrollTop"),
+                            result.get("scrollHeight"),
+                            result.get("clientHeight"),
+                        ),
+                        file=sys.stderr,
+                    )
             except Exception as e:
                 return {"success": False, "error": str(e)}
         else:
+            if DIAG:
+                try:
+                    sy_before = await self._page.evaluate("() => window.scrollY")
+                except Exception:
+                    sy_before = None
             await self._page.evaluate("d => window.scrollBy(0, d)", delta)
+            if DIAG:
+                try:
+                    sy_after = await self._page.evaluate("() => window.scrollY")
+                except Exception:
+                    sy_after = None
+                print(
+                    "[DIAG] scroll direction=%s amount=%d scrollY_before=%s scrollY_after=%s"
+                    % (direction, amount, sy_before, sy_after),
+                    file=sys.stderr,
+                )
 
         await asyncio.sleep(0.4)
         out: dict[str, Any] = {"success": True}
         try:
             content = await self._fetch_page_content()
             out["content"] = content
+            self._last_get_content_time = time.monotonic()
         except Exception:
             pass
         return out

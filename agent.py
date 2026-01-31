@@ -70,6 +70,7 @@ def _llm_timeout_sec() -> int:
 
 DEBUG_LLM = _env_bool("AGENT_DEBUG_LLM")
 SKIP_HYDRA_NORMALIZE = _env_bool("AGENT_SKIP_HYDRA_NORMALIZE")
+DIAG = _env_bool("AGENT_DIAG")
 
 
 def _openai_client() -> OpenAI:
@@ -431,6 +432,15 @@ async def run_agent() -> None:
                                 args = json.loads(tc.function.arguments or "{}")
                             except json.JSONDecodeError:
                                 args = {}
+                            if DIAG:
+                                now = time.monotonic()
+                                elapsed = now - step_start
+                                gap = (now - prev_tool_done) if i > 0 else 0.0
+                                print(
+                                    "[DIAG] step %d tool %d/%d: %s elapsed=%.1fs gap_since_prev=%.1fs"
+                                    % (step_used, i + 1, n_tools, name, elapsed, gap),
+                                    file=sys.stderr,
+                                )
                             if name == "click_element" and args.get("text"):
                                 text = args.get("text") or ""
                                 if DANGEROUS_PATTERNS.search(text):
@@ -504,6 +514,12 @@ async def run_agent() -> None:
                                         "tool_call_id": tc_skip.id,
                                         "content": json.dumps(payload_skip, ensure_ascii=False),
                                     })
+                                    if DIAG:
+                                        print(
+                                            "[DIAG] page_navigated: skipping tool %d/%d (%s)"
+                                            % (j + 1, n_tools, msg.tool_calls[j].function.name),
+                                            file=sys.stderr,
+                                        )
                                 break
 
                         step_elapsed = time.monotonic() - step_start

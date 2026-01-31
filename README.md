@@ -109,8 +109,24 @@ AGENT_HEADLESS=false
 **Отладка и таймауты:**
 
 - **`AGENT_DEBUG_LLM=1`** — перед каждым запросом к LLM выводить шаг, число сообщений, размер, роли, факт нормализации Hydra+Claude. Последний запрос сохраняется в `agent_debug_last_request.json`.
+- **`AGENT_DIAG=1`** — выводить в stderr маркеры MCP-сервера (клики, fallback'и, type_text по field_index). Полезно, чтобы по логам понять, какие ветки кода сработали.
 - **`AGENT_SKIP_HYDRA_NORMALIZE=1`** — отключить нормализацию сообщений для Claude через HydraAI (если из‑за неё таймауты или ошибки).
 - **`AGENT_LLM_TIMEOUT_SEC`** — таймаут запроса к LLM в секундах (по умолчанию 90). При медленном API можно увеличить (например `120` или `180`).
+
+**Маркеры в логах (по ним видно, применились ли изменения в коде):**
+
+| Что искать в логе | Значение |
+|-------------------|----------|
+| `[DIAG] navigate done url=...` | Навигация выполнена |
+| `[DIAG] get_page_content time_since_nav=...` | Вызов get_page_content с таймингами |
+| `[DIAG] click_element start text=...` | Начало клика по элементу |
+| `[DIAG] click_element text normalized` | В тексте были \xa0, \u2009, переносы — применена нормализация |
+| `[DIAG] click_element done ... page_navigated=1` | Клик вызвал переход на другую страницу |
+| `[DIAG] type_text filled field_index=N` | type_text успешно заполнил N-е поле |
+| `[DIAG] filter_off_screen filtered_buttons=N filtered_links=M` | Исключены N кнопок и M ссылок вне viewport/sr-only |
+| `[DIAG] scroll container=...` / `[DIAG] scroll direction=...` | Прокрутка контейнера или окна |
+| `[DIAG] step N tool N/M: ... elapsed=...` | Шаг агента, инструмент, время |
+| `[DIAG] page_navigated: skipping tool N/M (name)` | После навигации пропущены оставшиеся инструменты в шаге |
 
 ---
 
