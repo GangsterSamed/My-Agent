@@ -431,7 +431,6 @@ async def run_agent() -> None:
                                 args = json.loads(tc.function.arguments or "{}")
                             except json.JSONDecodeError:
                                 args = {}
-
                             if name == "click_element" and args.get("text"):
                                 text = args.get("text") or ""
                                 if DANGEROUS_PATTERNS.search(text):
@@ -494,6 +493,18 @@ async def run_agent() -> None:
                                 "content": payload_str,
                             })
                             prev_tool_done = time.monotonic()
+
+                            if payload.get("page_navigated") and i < n_tools - 1:
+                                skip_msg = "Страница изменилась после предыдущего действия. Вызови get_page_content перед следующим действием."
+                                for j in range(i + 1, n_tools):
+                                    tc_skip = msg.tool_calls[j]
+                                    payload_skip = {"success": False, "error": skip_msg, "page_changed_skip": True}
+                                    messages.append({
+                                        "role": "tool",
+                                        "tool_call_id": tc_skip.id,
+                                        "content": json.dumps(payload_skip, ensure_ascii=False),
+                                    })
+                                break
 
                         step_elapsed = time.monotonic() - step_start
                         print(_dim("  ⏱ %.1f с") % step_elapsed)

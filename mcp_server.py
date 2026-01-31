@@ -27,15 +27,24 @@ load_dotenv()
 STORAGE_STATE_PATH = (os.getenv("AGENT_STORAGE_STATE") or "browser_state.json").strip()
 HEADLESS = os.getenv("AGENT_HEADLESS", "false").lower() == "true"
 QUIET = os.getenv("AGENT_QUIET", "true").lower() in ("1", "true", "yes")
-# Таймаут клика/ввода (мс).
+# Таймаут клика/ввода (мс). В click_element используем no_wait_after=True, чтобы после клика по ссылке
+# Playwright не ждал навигацию до 30 с — иначе в фоне остаётся «Future exception was never retrieved».
 ACTION_TIMEOUT_MS = 8_000
 
 
 def _normalize_text(s: str | None) -> str:
-    """Нормализация текста для Playwright: неразрывные пробелы и лишние пробелы."""
+    """Нормализация текста для Playwright: Unicode-пробелы и переносы → обычный пробел, схлопывание пробелов."""
     if s is None or not isinstance(s, str):
         return ""
-    t = s.replace("\xa0", " ").replace("\u202f", " ")
+    t = (
+        s.replace("\xa0", " ")
+        .replace("\u202f", " ")
+        .replace("\u2009", " ")  # thin space (п.4)
+        .replace("\u2028", " ")
+        .replace("\u2029", " ")
+        .replace("\n", " ")
+        .replace("\r", " ")
+    )
     return " ".join(t.split())
 
 
@@ -271,15 +280,34 @@ class BrowserMCPServer:
             "success": True,
             "url": self._page.url,
             "title": await self._page.title(),
+            "page_navigated": True,
         }
 
     _PAGE_CONTENT_SCRIPT = """
         () => {
             document.querySelectorAll('a[target="_blank"], a[target="_new"]').forEach(a => a.removeAttribute('target'));
             const root = document.body;
-            const bodyText = root?.innerText ?? '';
+            let bodyText = root?.innerText ?? '';
             const sel = (s, r) => (r || root).querySelectorAll(s);
             const arr = (q) => Array.from(q);
+            const vw = window.innerWidth || 1280, vh = window.innerHeight || 720;
+            const isInViewport = (el) => {
+                if (!el || !el.getBoundingClientRect) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 && r.height === 0) return false;
+                return r.top < vh && r.bottom > 0 && r.left < vw && r.right > 0;
+            };
+            const isOffScreenOrSrOnly = (el) => {
+                if (!el || !el.getBoundingClientRect) return true;
+                const r = el.getBoundingClientRect();
+                if (r.left < -500 || r.top < -500 || r.left > vw + 500 || r.top > vh + 500) return true;
+                const s = window.getComputedStyle ? window.getComputedStyle(el) : {};
+                const leftVal = (s.left || '').trim();
+                if (leftVal.indexOf('-9999') !== -1 || (s.clip && s.clip.indexOf('rect(0px') === 0)) return true;
+                const cls = (el.className || '').toLowerCase();
+                if (/sr-only|visually-hidden|skip-link|off-screen|screen-reader/.test(cls)) return true;
+                return false;
+            };
             let modal = null;
             const dialogEl = root.querySelector('[role="dialog"]') || root.querySelector('[role="alertdialog"]') || root.querySelector('[aria-modal="true"]');
             let dialog = null;
@@ -297,12 +325,30 @@ class BrowserMCPServer:
                     .slice(0, 20);
                 modal = { text: mt, buttons: mb, inputs: mi };
             }
-            const buttons = arr(sel('button, [role="button"], input[type="submit"]'))
+            const allButtonEls = arr(sel('button, [role="button"], input[type="submit"]'));
+            const visibleButtonEls = allButtonEls.filter(el => isInViewport(el) && !isOffScreenOrSrOnly(el));
+            const buttons = visibleButtonEls
                 .map(el => el.innerText?.trim() || el.value || el.getAttribute('aria-label') || '')
                 .filter(t => t).slice(0, 30);
-            const links = arr(sel('a[href]'))
+            const allLinkEls = arr(sel('a[href]'));
+            const visibleLinkEls = allLinkEls.filter(el => isInViewport(el) && !isOffScreenOrSrOnly(el));
+            const links = visibleLinkEls
                 .map(el => ({ text: (el.innerText || '').trim().slice(0, 200), href: el.href }))
                 .filter(l => l.text).slice(0, 50);
+            const filtered_buttons = allButtonEls.length - visibleButtonEls.length;
+            const filtered_links = allLinkEls.length - visibleLinkEls.length;
+            const hiddenClickableTexts = allButtonEls
+                .filter(el => !isInViewport(el) || isOffScreenOrSrOnly(el))
+                .map(el => (el.innerText || el.value || el.getAttribute('aria-label') || '').trim())
+                .filter(t => t.length > 0);
+            const hiddenLinkTexts = allLinkEls
+                .filter(el => !isInViewport(el) || isOffScreenOrSrOnly(el))
+                .map(el => (el.innerText || '').trim())
+                .filter(t => t.length > 0);
+            const hiddenTextsToMask = [...new Set([...hiddenClickableTexts, ...hiddenLinkTexts])].filter(t => t.length < 300);
+            hiddenTextsToMask.forEach(t => {
+                if (bodyText.indexOf(t) !== -1) bodyText = bodyText.replace(t, '[скрытая ссылка]');
+            });
             const inputs = arr(sel('input, textarea, select'))
                 .map(el => ({ type: el.type, placeholder: el.placeholder || '', name: el.name || '', id: el.id || '' }))
                 .slice(0, 30);
@@ -394,7 +440,9 @@ class BrowserMCPServer:
                 fillable_inputs: fillableInputs,
                 scrollable_containers: [...new Set(scrollable)].slice(0, 5),
                 url: window.location.href,
-                title: document.title
+                title: document.title,
+                filtered_buttons: filtered_buttons,
+                filtered_links: filtered_links
             };
         }
     """
@@ -409,7 +457,7 @@ class BrowserMCPServer:
         include_html = bool(args.get("include_html"))
         try:
             content = await self._fetch_page_content()
-            out: dict[str, Any] = {"success": True, "content": content}
+            out: dict[str, Any] = {"success": True, "content": {k: v for k, v in content.items() if k not in ("filtered_buttons", "filtered_links")}}
             if include_html:
                 out["html"] = (await self._page.content())[:50000]
             return out
@@ -456,62 +504,25 @@ class BrowserMCPServer:
             else:
                 return {"success": False, "error": "Укажи text, selector или role"}
 
-            try:
-                await loc.scroll_into_view_if_needed(timeout=5_000)
-            except Exception:
-                pass
-
-            if use_sel:
-                await loc.click(timeout=ACTION_TIMEOUT_MS)
+            url_before_click = self._page.url
+            if use_sel or role:
+                await loc.click(timeout=ACTION_TIMEOUT_MS, no_wait_after=True)
             elif use_text:
-                err = None
                 try:
-                    await loc.click(timeout=ACTION_TIMEOUT_MS)
-                except Exception as e:
-                    err = e
-                if err is not None:
-                    for fallback_role in ("button", "link"):
-                        try:
-                            loc2 = scope.get_by_role(fallback_role, name=use_text).first
-                            try:
-                                await loc2.scroll_into_view_if_needed(timeout=5_000)
-                            except Exception:
-                                pass
-                            await loc2.click(timeout=ACTION_TIMEOUT_MS)
-                            err = None
-                            break
-                        except Exception as e2:
-                            err = e2
-                    if err is not None and use_text and exact:
-                        try:
-                            loc_partial = scope.get_by_text(use_text, exact=False).first
-                            try:
-                                await loc_partial.scroll_into_view_if_needed(timeout=5_000)
-                            except Exception:
-                                pass
-                            await loc_partial.click(timeout=ACTION_TIMEOUT_MS)
-                            err = None
-                        except Exception as e2b:
-                            err = e2b
-                    if err is not None and use_text:
-                        short_text = (use_text[:50].strip() if len(use_text) > 50 else use_text).strip()
-                        if short_text and len(short_text) < len(use_text):
-                            try:
-                                loc_short = scope.get_by_text(short_text, exact=False).first
-                                try:
-                                    await loc_short.scroll_into_view_if_needed(timeout=5_000)
-                                except Exception:
-                                    pass
-                                await loc_short.click(timeout=ACTION_TIMEOUT_MS)
-                                err = None
-                            except Exception as e3:
-                                err = e3
-                    if err is not None:
-                        raise err
-            elif role:
-                await loc.click(timeout=ACTION_TIMEOUT_MS)
+                    await loc.click(timeout=ACTION_TIMEOUT_MS, no_wait_after=True)
+                except Exception:
+                    if scope != self._page:
+                        loc = scope.get_by_role("button", name=use_text).first
+                        await loc.click(timeout=ACTION_TIMEOUT_MS, no_wait_after=True)
+                    else:
+                        raise
             await asyncio.sleep(0.8)
-            return {"success": True}
+            url_after = self._page.url
+            page_navigated = url_after != url_before_click
+            result: dict[str, Any] = {"success": True}
+            if page_navigated:
+                result["page_navigated"] = True
+            return result
         except Exception as e:
             err = str(e)
             sug = "Попробуй другой способ (другой текст/селектор) или scroll перед кликом. Используй только текст кнопок/ссылок из последнего get_page_content; для длинных названий — короткий фрагмент (первые слова)."
