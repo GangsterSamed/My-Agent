@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Точка входа: запуск Browser Agent (MCP). Использование: python3 main.py"""
+"""Точка входа: python3 main.py"""
 from __future__ import annotations
 
 import sys
