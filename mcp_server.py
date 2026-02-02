@@ -100,7 +100,7 @@ def _tools() -> list[types.Tool]:
                     "amount": {"type": "integer", "description": "Пиксели", "default": 500},
                     "container_selector": {
                         "type": "string",
-                        "description": "CSS-селектор скроллируемого контейнера (опционально). Если кнопки/ссылки внутри меню не видны — укажи контейнер из get_page_content.",
+                        "description": "CSS-селектор скроллируемого контейнера (опционально). Если кнопки/ссылки внутри списка или контейнера не видны — укажи контейнер из get_page_content.",
                     },
                 },
             },
@@ -673,17 +673,20 @@ class BrowserMCPServer:
                                     (use_text or "")[:50],
                                 ), file=sys.stderr)
                     if not in_dialog:
-                        primary_btn = diag_d.get("primaryActionBtn") or None
-                        btn_hint = primary_btn if primary_btn else "Добавить"
+                        btn_texts = diag_d.get("btnTexts") or []
+                        btns_preview = ", ".join((t or "")[:30] for t in btn_texts[:6] if t)
                         if DIAG:
-                            print("[DIAG] click_element: text %r not in dialog -> return error suggest=%r" % (
+                            print("[DIAG] click_element: text %r not in dialog btnTexts=%s" % (
                                 (use_text or "")[:50],
-                                btn_hint[:40],
+                                btns_preview[:80],
                             ), file=sys.stderr)
+                        sug = "Проверь текст кнопок в модальном окне."
+                        if btns_preview:
+                            sug = f"Кнопки в диалоге: {btns_preview[:120]}. Выбери подходящую."
                         return {
                             "success": False,
                             "error": f"В модальном окне нет «{use_text}».",
-                            "suggestion": f"Нажми «{btn_hint}» в модалке для подтверждения.",
+                            "suggestion": sug,
                         }
             except Exception:
                 pass
@@ -1014,11 +1017,22 @@ class BrowserMCPServer:
                         except Exception as pe:
                             if DIAG:
                                 print("[DIAG] click_element dialog Playwright fallback err: %s" % str(pe)[:80], file=sys.stderr)
+                            return {
+                                "success": False,
+                                "error": "Элемент в диалоге не кликается: %s" % str(pe)[:80],
+                                "suggestion": "Проверь текст кнопок в модальном окне.",
+                            }
                     elif result_d.get("usePlaywrightClick"):
                         try:
                             await s.get_by_text(use_text or "", exact=False).first.click(timeout=ACTION_TIMEOUT_MS, no_wait_after=True)
-                        except Exception:
-                            pass
+                        except Exception as pe:
+                            if DIAG:
+                                print("[DIAG] click_element dialog Playwright fallback err: %s" % str(pe)[:80], file=sys.stderr)
+                            return {
+                                "success": False,
+                                "error": "Элемент в диалоге не кликается: %s" % str(pe)[:80],
+                                "suggestion": "Проверь текст кнопок в модальном окне.",
+                            }
                 else:
                     result_js = await self._page.evaluate(_JS_CLICK_SCRIPT, [use_text])
                     if not (isinstance(result_js, dict) and result_js.get("ok")):
@@ -1036,7 +1050,7 @@ class BrowserMCPServer:
                             return {
                                 "success": False,
                                 "error": f"Неоднозначный запрос: найдено {count} элементов с текстом «{req_text}».",
-                                "suggestion": f"Уточни запрос, указав контекст рядом с элементом. Примеры найденных: {ctx_preview}. Или кликни сначала нужный элемент (название или блок), затем кнопку в открывшемся окне."
+                                "suggestion": f"Уточни запрос, указав контекст рядом с элементом. Примеры найденных: {ctx_preview}. Или кликни сначала нужный элемент (блок/контейнер), затем кнопку в открывшемся окне."
                             }
                         if DIAG and isinstance(result_js, dict) and result_js.get("debug"):
                             d = result_js["debug"]
@@ -1050,9 +1064,9 @@ class BrowserMCPServer:
                             return {
                                 "success": False,
                                 "error": f"Элемент не найден. Запрос слишком длинный ({word_count} слов).",
-                                "suggestion": f"Кликни только название (первые слова), например: «{first_words}»."
+                                "suggestion": f"Используй первые слова запроса, например: «{first_words}»."
                             }
-                        return {"success": False, "error": "Элемент не найден", "suggestion": "Проверь текст по get_page_content; для длинных названий — первые слова."}
+                        return {"success": False, "error": "Элемент не найден", "suggestion": "Проверь текст по get_page_content; для длинного запроса — первые слова."}
                     if DIAG:
                         m = result_js.get("matched", "")
                         ctx = result_js.get("clickedContext", "")
@@ -1228,11 +1242,11 @@ class BrowserMCPServer:
         except Exception as e:
             err = str(e)
             err_lower = err.lower()
-            suf = " Вызови get_page_content и укажи placeholder, selector или field_index (1, 2, 3…) по порядку полей; для сопроводительного письма ищи textarea."
+            suf = " Вызови get_page_content и укажи placeholder, selector или field_index (1, 2, 3…) по порядку полей; для длинного текста подойдёт textarea."
             if ("timeout" in err_lower or "exceeded" in err_lower) and (
                 "input" in err_lower or "textarea" in err_lower or "placeholder" in err_lower or "locator(" in err_lower
             ):
-                suf += " Если форма с полями ещё не открыта — сначала открой её (кнопка/ссылка на странице), затем get_page_content и заполняй поля по placeholder/selector/field_index. [hint: open_form_first]"
+                suf += " Если форма с полями ещё не открыта — сначала открой её (кнопка/ссылка на странице), затем get_page_content и заполняй поля по placeholder/selector/field_index."
             if effective_scope != self._page:
                 suf += " Диалог открыт: используй placeholder или selector для поля внутри него."
             if field_index is not None:

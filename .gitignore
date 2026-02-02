@@ -1,5 +1,7 @@
 .env
 browser_state.json
+*.log
+.DS_Store
 agent_debug_last_request.json
 *.pyc
 __pycache__/

@@ -279,9 +279,31 @@ async def _do_wait_for_user() -> dict:
 HANDOVER_AFTER_RETRIES = _env_bool("AGENT_HANDOVER_AFTER_RETRIES", default=True)
 
 
-async def _do_handover_to_user() -> dict:
+def _format_handover_hint(name: str, args: dict) -> str:
+    if name == "click_element":
+        t = args.get("text") or args.get("selector") or "элемент"
+        return f"Кликните по «{t}»."
+    if name == "type_text":
+        t = (args.get("text") or "")[:60]
+        if args.get("field_index"):
+            ph = f"поле №{args['field_index']}"
+        elif args.get("placeholder"):
+            ph = f"«{args['placeholder']}»"
+        else:
+            ph = "поле"
+        return f"Введите «{t}» в {ph}."
+    if name == "scroll":
+        d = args.get("direction") or "вниз"
+        return f"Прокрутите страницу {d}."
+    return "Выполните нужный шаг."
+
+
+async def _do_handover_to_user(name: str = "", args: dict | None = None) -> dict:
+    hint = _format_handover_hint(name, args or {}) if name else ""
     print()
     print(_yellow("  ⏸ Действие не удалось после 3 попыток. Управление передаётся вам."))
+    if hint:
+        print(_yellow("     Что сделать: ") + hint)
     print(_dim("     Выполните шаг вручную в браузере и напишите «готово» или «done», когда закончите."))
     print()
     while True:
@@ -313,7 +335,7 @@ async def run_agent() -> None:
 1. Сначала анализируй страницу (get_page_content), потом действуй (click_element, type_text и т.д.).
 2. Ищи элементы по видимому тексту или по типу; не придумывай селекторы — используй то, что видишь на странице.
 2a. Одна вкладка: новые вкладки запрещены, все ссылки открываются в текущей. Кликай по ссылкам по одной; после клика — get_page_content. Чтобы вернуться назад, используй go_back.
-3. При ошибке инструмента пробуй другой способ (другой текст, scroll, другой элемент). Перед повторным кликом по тому же тексту — get_page_content или scroll (при необходимости scroll с container_selector для меню/списков).
+3. При ошибке инструмента пробуй другой способ (другой текст, scroll, другой элемент). Перед повторным кликом по тому же тексту — get_page_content или scroll (при необходимости scroll с container_selector для списков и контейнеров).
 3a. Если открыто модальное окно (в get_page_content есть [Модальное окно] или modal): работай только с ним. Клики и ввод — только внутри. Передавай text или selector элемента, не [role=dialog]. Для ввода — placeholder или selector поля.
 3b. Опции выбора (радио, чекбоксы, селекты): если в get_page_content видишь «Опции» с подписями типа [checkbox], [radio], [select] — это элементы выбора. Чтобы выбрать опцию, кликай по её подписи.
 4. Работай автономно, пока задача не выполнена или не понадобится уточнение у пользователя.
@@ -495,7 +517,8 @@ async def run_agent() -> None:
                                 nfail = action_failures.get(action_key, 0)
                                 if nfail >= MAX_SAME_ACTION_RETRIES:
                                     if HANDOVER_AFTER_RETRIES:
-                                        payload = await _do_handover_to_user()
+                                        payload = await _do_handover_to_user(name, args)
+                                        action_failures[action_key] = 0
                                     else:
                                         payload = {
                                             "success": False,
